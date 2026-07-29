@@ -43,14 +43,12 @@ HOOK_DIR="/jffs/scripts"
 BEGIN_MARKER="# BEGIN WAS110-MANAGER"
 END_MARKER="# END WAS110-MANAGER"
 
-TAG="was110-manager"
-
 ###############################################################################
 # Logging
 ###############################################################################
 
 log_msg() {
-    logger -t "$TAG" "$*" 2>/dev/null
+    logger -t "was110-manager" "$*" 2>/dev/null
 }
 
 print_msg() {
