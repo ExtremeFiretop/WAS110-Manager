@@ -15,6 +15,7 @@
 #   uninstall   Completely remove this installation
 #
 # Running with no argument defaults to "install".
+# Hardened revision 2026-11-15: serialized, non-disruptive reconciliation.
 ###############################################################################
 
 ###############################################################################
@@ -23,12 +24,22 @@
 
 ONT_IP="192.168.11.1"
 
+# Safety guard for this installation.  The management address must NEVER be
+# installed on ppp0, the LAN bridge, or an unexpected WAN interface.
+EXPECTED_ONT_IF="vlan4094"
+
 ###############################################################################
 # SCRIPT Configuration (DO NOT TOUCH UNLESS SURE!)
 ###############################################################################
 
 NAT_CHAIN="WAS110_NAT"
 FORWARD_CHAIN="WAS110_FWD"
+NAT_STAGE="WAS110_NAT_NEW"
+FORWARD_STAGE="WAS110_FWD_NEW"
+LOCK_DIR="/tmp/was110-manager.lock"
+LOCK_WAIT_SECONDS=10
+LOCK_HELD=0
+CHANGED=0
 
 # Detected dynamically at runtime.
 LAN_IF=""
@@ -43,17 +54,100 @@ HOOK_DIR="/jffs/scripts"
 BEGIN_MARKER="# BEGIN WAS110-MANAGER"
 END_MARKER="# END WAS110-MANAGER"
 
+TAG="was110-manager"
+
 ###############################################################################
 # Logging
 ###############################################################################
 
 log_msg() {
-    logger -t "was110-manager" "$*" 2>/dev/null
+    logger -t "$TAG" "$*" 2>/dev/null || :
 }
 
 print_msg() {
     printf '%s\n' "$*"
     log_msg "$*"
+}
+
+###############################################################################
+# Single-writer lock shared by install/apply/uninstall and all Merlin hooks.
+# mkdir is atomic on the router filesystem, and requires no Entware/flock.
+###############################################################################
+
+release_lock() {
+    local lock_owner
+    if [ "$LOCK_HELD" = 1 ]; then
+        # Only this PID may release the lock it acquired.
+        if [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then
+            rm -f "$LOCK_DIR/pid"
+            rmdir "$LOCK_DIR" 2>/dev/null || :
+        fi
+        LOCK_HELD=0
+    fi
+}
+
+acquire_lock() {
+    local lock_attempt owner
+    lock_attempt=0
+    while [ "$lock_attempt" -le "$LOCK_WAIT_SECONDS" ]; do
+        if (umask 077; mkdir "$LOCK_DIR" 2>/dev/null); then
+            if ! printf '%s\n' "$$" > "$LOCK_DIR/pid"; then
+                rmdir "$LOCK_DIR" 2>/dev/null || :
+                log_msg 'ERROR: could not record lock owner'
+                return 1
+            fi
+            LOCK_HELD=1
+            trap 'release_lock' 0
+            trap 'exit 129' HUP
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+            return 0
+        fi
+
+        owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || :)"
+        case "$owner" in
+            ''|*[!0-9]*)
+                # A different invocation may be between mkdir and PID write.
+                # Only remove an empty, ownerless lock after the full timeout.
+                if [ "$lock_attempt" -eq "$LOCK_WAIT_SECONDS" ]; then
+                    rmdir "$LOCK_DIR" 2>/dev/null || :
+                    if (umask 077; mkdir "$LOCK_DIR" 2>/dev/null); then
+                        if ! printf '%s\n' "$$" > "$LOCK_DIR/pid"; then
+                            rmdir "$LOCK_DIR" 2>/dev/null || :
+                            return 1
+                        fi
+                        LOCK_HELD=1
+                        trap 'release_lock' 0
+                        trap 'exit 129' HUP
+                        trap 'exit 130' INT
+                        trap 'exit 143' TERM
+                        return 0
+                    fi
+                fi
+                ;;
+            *)
+                if ! kill -0 "$owner" 2>/dev/null; then
+                    # Stale owner: re-check before removal, and fail closed
+                    # if another process is already taking ownership.
+                    if [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$owner" ]; then
+                        rm -f "$LOCK_DIR/pid"
+                        if rmdir "$LOCK_DIR" 2>/dev/null; then
+                            continue
+                        fi
+                    fi
+                fi
+                ;;
+        esac
+        [ "$lock_attempt" -lt "$LOCK_WAIT_SECONDS" ] || break
+        lock_attempt=$((lock_attempt + 1))
+        sleep 1
+    done
+    log_msg "DEFERRED: exclusive lock busy after ${LOCK_WAIT_SECONDS}s (owner=${owner:-unknown})"
+    return 1
+}
+
+uptime_seconds() {
+    awk -F. '{print $1; exit}' /proc/uptime 2>/dev/null
 }
 
 ###############################################################################
@@ -73,7 +167,8 @@ detect_ont_settings() {
     # A PPP interface is not suitable for direct ONT management access.
     case "$ONT_IF" in
         ppp*)
-            ONT_IF=""
+            log_msg "Refusing logical WAN interface $ONT_IF"
+            return 2
             ;;
     esac
 
@@ -82,6 +177,13 @@ detect_ont_settings() {
         return 1
     }
 
+    # Never silently move the management alias to an unexpected interface.
+    # WAN firmware can temporarily expose a logical PPP device or a different
+    # primary-WAN mapping while applying settings.
+    if [ "$ONT_IF" != "$EXPECTED_ONT_IF" ]; then
+        log_msg "Refusing WAN interface $ONT_IF (expected $EXPECTED_ONT_IF)"
+        return 2
+    fi
     ip link show "$ONT_IF" >/dev/null 2>&1 || {
         log_msg "Detected WAN interface $ONT_IF does not exist"
         return 1
@@ -173,122 +275,278 @@ detect_primary_lan() {
 
 ###############################################################################
 # Runtime configuration
+#
+# The dedicated chains are owned by this script.  Correct chains are NEVER
+# flushed.  On a genuine mismatch, populate a staging chain first, install
+# its jump, then retire the old chain.  The old or new protection is therefore
+# present throughout a normal repair, including interrupted repairs.
 ###############################################################################
 
+ipt() {
+    local table
+    table="$1"
+    shift
+    case "$table" in
+        nat) iptables -t nat "$@" ;;
+        filter) iptables "$@" ;;
+        *) return 2 ;;
+    esac
+}
+
+chain_exists() {
+    ipt "$1" -S "$2" >/dev/null 2>&1
+}
+
+# An existing alias with a different prefix is treated as a conflict, not
+# overwritten during the WAN's PPP negotiation.
 ensure_address() {
-    # The physical WAN VLAN must exist before the alias can be added.
+    local all_aliases
     ip link show "$ONT_IF" >/dev/null 2>&1 || return 1
+    all_aliases="$(ip -4 addr show dev "$ONT_IF" 2>/dev/null)" || return 1
 
-    # Adds or refreshes:
-    #
-    # 192.168.11.2/24 on vlan4094
-    #
-    # This also creates:
-    #
-    # 192.168.11.0/24 dev vlan4094 src 192.168.11.2
-    ip addr replace \
-        "$ONT_ALIAS_IP/$ONT_PREFIX" \
-        dev "$ONT_IF" >/dev/null 2>&1 || return 1
+    if printf '%s\n' "$all_aliases" | awk -v want="$ONT_ALIAS_IP/$ONT_PREFIX" '
+        $1 == "inet" && $2 == want {found=1}
+        END {exit !found}
+    '; then
+        return 0
+    fi
+    if printf '%s\n' "$all_aliases" | awk -v ip="$ONT_ALIAS_IP" '
+        $1 == "inet" {split($2,parts,"/"); if (parts[1] == ip) found=1}
+        END {exit !found}
+    '; then
+        log_msg "ERROR: alias $ONT_ALIAS_IP already exists with unexpected prefix on $ONT_IF"
+        return 2
+    fi
 
+    # Add only when absent; do not churn the kernel address/route state.
+    ip addr add "$ONT_ALIAS_IP/$ONT_PREFIX" dev "$ONT_IF" >/dev/null 2>&1 || {
+        log_msg "ERROR: could not add $ONT_ALIAS_IP/$ONT_PREFIX to $ONT_IF"
+        return 1
+    }
+    CHANGED=1
+    log_msg "Management alias added: $ONT_ALIAS_IP/$ONT_PREFIX dev $ONT_IF"
     return 0
 }
 
-ensure_nat_rules() {
-    # Create this installation's dedicated NAT chain when absent.
-    iptables -t nat -N "$NAT_CHAIN" 2>/dev/null || true
+# Ensure a jump is the FIRST rule and appears exactly once.  If it already
+# is, no iptables write is made.  Duplicate removals use rule numbers in
+# descending order, preserving the first/top jump throughout.
+ensure_parent_jump() {
+    local table parent target first extra index
+    table="$1" parent="$2" target="$3"
+    first="$(ipt "$table" -S "$parent" 2>/dev/null | awk -v p="$parent" -v t="$target" '
+        $1 == "-A" && $2 == p {
+            if (NF == 4 && $3 == "-j" && $4 == t) print "yes"
+            else print "no"
+            exit
+        }')" || return 1
 
-    # Rebuild only this installation's chain.
-    iptables -t nat -F "$NAT_CHAIN" || return 1
+    if [ "$first" != yes ]; then
+        ipt "$table" -I "$parent" 1 -j "$target" || return 1
+        CHANGED=1
+    fi
 
-    # Translate primary-LAN traffic to the WAS-110 management address.
-    iptables -t nat -A "$NAT_CHAIN" \
-        -s "$PRIMARY_SUBNET" \
-        -d "$ONT_IP/32" \
-        -o "$ONT_IF" \
-        -j SNAT --to-source "$ONT_ALIAS_IP" || return 1
-
-    # Add one jump from POSTROUTING to this installation's chain.
-    iptables -t nat -C POSTROUTING \
-        -j "$NAT_CHAIN" 2>/dev/null || \
-    iptables -t nat -I POSTROUTING 1 \
-        -j "$NAT_CHAIN" || return 1
-
-    return 0
+    extra="$(ipt "$table" -S "$parent" 2>/dev/null | awk -v p="$parent" -v t="$target" '
+        $1 == "-A" && $2 == p {
+            n++
+            if (n > 1 && NF == 4 && $3 == "-j" && $4 == t) print n
+        }' | sort -rn)" || return 1
+    for index in $extra; do
+        ipt "$table" -D "$parent" "$index" || return 1
+        CHANGED=1
+    done
+    ipt "$table" -C "$parent" -j "$target" >/dev/null 2>&1
 }
 
-ensure_firewall_rules() {
-    # Create this installation's dedicated forwarding chain when absent.
-    iptables -N "$FORWARD_CHAIN" 2>/dev/null || true
+remove_parent_jumps() {
+    local table parent target iterations
+    table="$1" parent="$2" target="$3"
+    iterations=0
+    while ipt "$table" -C "$parent" -j "$target" >/dev/null 2>&1; do
+        ipt "$table" -D "$parent" -j "$target" || return 1
+        iterations=$((iterations + 1))
+        [ "$iterations" -le 64 ] || {
+            log_msg "ERROR: too many parent jumps to $target; refusing continued changes"
+            return 1
+        }
+    done
+}
 
-    # Rebuild only this installation's chain.
-    iptables -F "$FORWARD_CHAIN" || return 1
+# Matches complete membership plus the required order of the two ACCEPT
+# rules followed by two DROP rules.  -C handles iptables serialization
+# differences such as explicit /32 masks and conntrack option rendering.
+chain_rules_valid() {
+    local table chain count sequence
+    table="$1" chain="$2"
+    chain_exists "$table" "$chain" || return 1
+    count="$(ipt "$table" -S "$chain" 2>/dev/null | awk -v c="$chain" '$1 == "-A" && $2 == c {n++} END {print n+0}')" || return 1
 
-    # Permit clients entering through the primary LAN bridge and belonging
-    # to the primary LAN subnet.
-    iptables -A "$FORWARD_CHAIN" \
-        -i "$LAN_IF" \
-        -s "$PRIMARY_SUBNET" \
-        -d "$ONT_IP/32" \
-        -o "$ONT_IF" \
-        -j ACCEPT || return 1
+    if [ "$table" = nat ]; then
+        [ "$count" -eq 1 ] || return 1
+        ipt nat -C "$chain" -s "$PRIMARY_SUBNET" -d "$ONT_IP/32" \
+            -o "$ONT_IF" -j SNAT --to-source "$ONT_ALIAS_IP" >/dev/null 2>&1
+    else
+        [ "$count" -eq 4 ] || return 1
+        sequence="$(ipt filter -S "$chain" 2>/dev/null | awk -v c="$chain" '
+            $1 == "-A" && $2 == c {
+                for (i=3;i<=NF;i++) if ($i == "-j") {printf "%s%s",(n++ ? " " : ""),$(i+1); break}
+            }
+        ')" || return 1
+        [ "$sequence" = 'ACCEPT ACCEPT DROP DROP' ] || return 1
+        ipt filter -C "$chain" -i "$LAN_IF" -s "$PRIMARY_SUBNET" \
+            -d "$ONT_IP/32" -o "$ONT_IF" -j ACCEPT >/dev/null 2>&1 &&
+        ipt filter -C "$chain" -i "$ONT_IF" -s "$ONT_IP/32" \
+            -d "$PRIMARY_SUBNET" -o "$LAN_IF" \
+            -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1 &&
+        ipt filter -C "$chain" -d "$ONT_IP/32" -j DROP >/dev/null 2>&1 &&
+        ipt filter -C "$chain" -s "$ONT_IP/32" -j DROP >/dev/null 2>&1
+    fi
+}
 
-    # Permit established return traffic from the WAS-110 to the primary LAN.
-    iptables -A "$FORWARD_CHAIN" \
-        -i "$ONT_IF" \
-        -s "$ONT_IP/32" \
-        -d "$PRIMARY_SUBNET" \
-        -o "$LAN_IF" \
-        -m conntrack --ctstate ESTABLISHED,RELATED \
-        -j ACCEPT || return 1
+append_chain_rules() {
+    local table chain
+    table="$1" chain="$2"
+    if [ "$table" = nat ]; then
+        ipt nat -A "$chain" -s "$PRIMARY_SUBNET" -d "$ONT_IP/32" \
+            -o "$ONT_IF" -j SNAT --to-source "$ONT_ALIAS_IP"
+    else
+        ipt filter -A "$chain" -i "$LAN_IF" -s "$PRIMARY_SUBNET" \
+            -d "$ONT_IP/32" -o "$ONT_IF" -j ACCEPT &&
+        ipt filter -A "$chain" -i "$ONT_IF" -s "$ONT_IP/32" \
+            -d "$PRIMARY_SUBNET" -o "$LAN_IF" \
+            -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
+        ipt filter -A "$chain" -d "$ONT_IP/32" -j DROP &&
+        ipt filter -A "$chain" -s "$ONT_IP/32" -j DROP
+    fi
+}
 
-    # Explicitly prevent guest bridges, guest VLANs, secondary LANs, VPN
-    # clients, and any other routed interface from reaching the WAS-110.
-    iptables -A "$FORWARD_CHAIN" \
-        -d "$ONT_IP/32" \
-        -j DROP || return 1
+# Clean only a detached staging chain after verifying table-wide references.
+# Never flush a chain whose jump may still be in use.
+cleanup_orphan_stage() {
+    local table stage all_rules references_rc
+    table="$1" stage="$2"
+    chain_exists "$table" "$stage" || return 0
+    all_rules="$(ipt "$table" -S 2>/dev/null)" || return 1
+    if printf '%s\n' "$all_rules" | awk -v t="$stage" '
+        $1 == "-A" {
+            for (i=3;i<NF;i++) if ($i == "-j" && $(i+1) == t) found=1
+        }
+        END {exit !found}
+    '; then
+        log_msg "ERROR: staging chain $stage still referenced; leaving intact"
+        return 1
+    fi
+    ipt "$table" -F "$stage" && ipt "$table" -X "$stage" || return 1
+    CHANGED=1
+    log_msg "Removed detached staging chain $stage"
+}
 
-    # Prevent unsolicited traffic from the WAS-110 from being forwarded to
-    # any interface other than permitted established primary-LAN sessions.
-    iptables -A "$FORWARD_CHAIN" \
-        -s "$ONT_IP/32" \
-        -j DROP || return 1
+ensure_chain() {
+    local table parent live stage
+    table="$1" parent="$2" live="$3" stage="$4"
 
-    # Add one jump at the beginning of the main FORWARD chain so the explicit
-    # WAS-110 restrictions are evaluated before general WAN/guest rules.
-    iptables -C FORWARD \
-        -j "$FORWARD_CHAIN" 2>/dev/null || \
-    iptables -I FORWARD 1 \
-        -j "$FORWARD_CHAIN" || return 1
+    if chain_rules_valid "$table" "$live"; then
+        # If an interrupted repair left a staged jump behind, restore the
+        # known-good live chain to priority before removing that jump.
+        ensure_parent_jump "$table" "$parent" "$live" || return 1
+        if chain_exists "$table" "$stage"; then
+            if ipt "$table" -C "$parent" -j "$stage" >/dev/null 2>&1; then
+                remove_parent_jumps "$table" "$parent" "$stage" || return 1
+                CHANGED=1
+                log_msg "Recovered stale $table staging jump, retained verified $live"
+            fi
+            cleanup_orphan_stage "$table" "$stage" || return 1
+        fi
+        return 0
+    fi
 
-    return 0
+    if chain_exists "$table" "$stage" && ! chain_rules_valid "$table" "$stage"; then
+        cleanup_orphan_stage "$table" "$stage" || {
+            log_msg "ERROR: unexpected referenced staging chain $stage; refusing unsafe rebuild"
+            return 1
+        }
+    fi
+    if chain_exists "$table" "$stage"; then
+        # Recover a verified, interrupted staged swap without flushing its
+        # still-referenced rules.
+        log_msg "Resuming verified staged $table chain $stage"
+    else
+        ipt "$table" -N "$stage" || return 1
+        if ! append_chain_rules "$table" "$stage"; then
+            ipt "$table" -F "$stage" >/dev/null 2>&1 || :
+            ipt "$table" -X "$stage" >/dev/null 2>&1 || :
+            return 1
+        fi
+        chain_rules_valid "$table" "$stage" || return 1
+    fi
+
+    # Stage first, so WAN management filtering is never absent during swap.
+    ensure_parent_jump "$table" "$parent" "$stage" || return 1
+    remove_parent_jumps "$table" "$parent" "$live" || return 1
+    if chain_exists "$table" "$live"; then
+        ipt "$table" -F "$live" || return 1
+        ipt "$table" -X "$live" || return 1
+    fi
+    ipt "$table" -E "$stage" "$live" || return 1
+    ensure_parent_jump "$table" "$parent" "$live" || return 1
+    CHANGED=1
+    log_msg "Installed verified $table chain $live via prepopulated staging"
 }
 
 apply_all() {
+    local attempt step_rc
     attempt=1
-
-    # During boot, the interfaces or firewall tables may not be ready on the
-    # first attempt. All operations are idempotent, so retries are safe.
     while [ "$attempt" -le 5 ]; do
-        if detect_ont_settings &&
-           detect_primary_lan &&
-           ensure_address &&
-           ensure_nat_rules &&
-           ensure_firewall_rules; then
-
-            log_msg \
-                "Configuration applied: LAN=$LAN_IF subnet=$PRIMARY_SUBNET ONT=$ONT_IF"
-
-            return 0
+        # Hard configuration conflicts are not boot-time transient failures.
+        if detect_ont_settings; then
+            step_rc=0
+        else
+            step_rc=$?
         fi
-
+        if [ "$step_rc" -eq 2 ]; then break; fi
+        if [ "$step_rc" -eq 0 ] && detect_primary_lan &&
+           [ "$LAN_IF" != "$ONT_IF" ]; then
+            if ensure_address; then
+                step_rc=0
+            else
+                step_rc=$?
+            fi
+            if [ "$step_rc" -eq 2 ]; then break; fi
+            if [ "$step_rc" -eq 0 ] &&
+               ensure_chain filter FORWARD "$FORWARD_CHAIN" "$FORWARD_STAGE" &&
+               ensure_chain nat POSTROUTING "$NAT_CHAIN" "$NAT_STAGE"; then
+                log_msg "Configuration verified: LAN=$LAN_IF subnet=$PRIMARY_SUBNET ONT=$ONT_IF result=$([ "$CHANGED" = 1 ] && printf repaired || printf unchanged)"
+                return 0
+            fi
+        fi
+        [ "$attempt" -lt 5 ] || break
         attempt=$((attempt + 1))
         sleep 2
     done
-
-    log_msg \
-        "Configuration could not be completely applied after five attempts"
-
+    log_msg 'ERROR: configuration could not be verified after five attempts'
     return 1
+}
+
+apply_with_lock() {
+    local action start_seconds end_seconds duration rc
+    action="$1"
+    acquire_lock || return 1
+    CHANGED=0
+    start_seconds="$(uptime_seconds)"
+    log_msg "Apply begin: source=$action pid=$$"
+    if apply_all; then
+        rc=0
+    else
+        rc=$?
+    fi
+    end_seconds="$(uptime_seconds)"
+    case "$start_seconds:$end_seconds" in
+        *[!0-9:]*|:*|*:) duration='unknown' ;;
+        *) duration=$((end_seconds - start_seconds)) ;;
+    esac
+    log_msg "Apply end: source=$action pid=$$ result=$rc duration=${duration}s"
+    release_lock
+    return "$rc"
 }
 
 ###############################################################################
@@ -359,7 +617,14 @@ remove_runtime_configuration() {
             -j "$NAT_CHAIN" || break
     done
 
-    # Remove this installation's NAT chain.
+    # Also remove any staging jump left by an interrupted hot swap.
+    while iptables -t nat -C POSTROUTING -j "$NAT_STAGE" 2>/dev/null; do
+        iptables -t nat -D POSTROUTING -j "$NAT_STAGE" || break
+    done
+
+    # Remove this installation's NAT chain and any detached staging chain.
+    iptables -t nat -F "$NAT_STAGE" 2>/dev/null || true
+    iptables -t nat -X "$NAT_STAGE" 2>/dev/null || true
     iptables -t nat -F "$NAT_CHAIN" 2>/dev/null || true
     iptables -t nat -X "$NAT_CHAIN" 2>/dev/null || true
 
@@ -371,7 +636,14 @@ remove_runtime_configuration() {
             -j "$FORWARD_CHAIN" || break
     done
 
-    # Remove this installation's forwarding chain.
+    # Also remove any staging jump left by an interrupted hot swap.
+    while iptables -C FORWARD -j "$FORWARD_STAGE" 2>/dev/null; do
+        iptables -D FORWARD -j "$FORWARD_STAGE" || break
+    done
+
+    # Remove this installation's forwarding chain and detached staging chain.
+    iptables -F "$FORWARD_STAGE" 2>/dev/null || true
+    iptables -X "$FORWARD_STAGE" 2>/dev/null || true
     iptables -F "$FORWARD_CHAIN" 2>/dev/null || true
     iptables -X "$FORWARD_CHAIN" 2>/dev/null || true
 
@@ -394,6 +666,7 @@ install_self() {
     target_path="$(readlink -f "$SCRIPT_PATH" 2>/dev/null)"
     [ -n "$target_path" ] || target_path="$SCRIPT_PATH"
 
+    acquire_lock || return 1
     chmod 755 "$SCRIPT_PATH" || return 1
 
     # All three Merlin event points call the same universal script.
@@ -402,6 +675,7 @@ install_self() {
     install_hook firewall-start || return 1
 
     # Apply immediately; no reboot is required.
+    CHANGED=0
     apply_all || {
         print_msg \
             "Installed, but the runtime configuration could not yet be applied."
@@ -429,6 +703,7 @@ install_self() {
 ###############################################################################
 
 uninstall_all() {
+    acquire_lock || return 1
     detect_ont_settings >/dev/null 2>&1 || true
 
     remove_hook wan-event
@@ -562,8 +837,8 @@ Usage: $0 [install|uninstall|apply|status]
       management address, temporary files, and installed script.
 
   apply
-      Detect the primary LAN subnet and reapply this installation's
-      management address, NAT chain, and forwarding chain.
+      Verify or safely repair only missing/changed management address,
+      NAT chain, and forwarding chain (serialized with Merlin hooks).
 
   status
       Show primary-LAN detection, installation, chains, route, and
@@ -585,7 +860,7 @@ case "${1:-install}" in
         ;;
 
     apply)
-        apply_all
+        apply_with_lock manual
         ;;
 
     status)
@@ -593,10 +868,19 @@ case "${1:-install}" in
         ;;
 
     hook)
-        # $2 identifies which Merlin hook invoked this script.
-        # Every Merlin hook runs the same idempotent configuration routine.
-        log_msg "Triggered by ${2:-unknown hook}"
-        apply_all
+        # Only primary WAN "connected" requires a wan-event reapply.
+        # Do not modify vlan4094 while PPPoE is tearing down or discovering.
+        case "${2:-}" in
+            wan-event)
+                if [ "${3:-}" != 0 ] || [ "${4:-}" != connected ]; then
+                    log_msg "WAN event ignored: unit=${3:-unknown} event=${4:-unknown}"
+                    exit 0
+                fi
+                ;;
+            nat-start|firewall-start) : ;;
+            *) log_msg "Unknown hook ignored: ${2:-empty}"; exit 0 ;;
+        esac
+        apply_with_lock "${2:-unknown}:${3:-}:${4:-}"
         ;;
 
     -h|--help|help)
